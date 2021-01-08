@@ -1826,13 +1826,21 @@ static int
 write_pool(struct entropy_store *r, const char __user *buffer, size_t count)
 {
 	size_t bytes;
-	__u32 buf[16];
+	__u32 t, buf[16];
 	const char __user *p = buffer;
 
 	while (count > 0) {
+		int b, i = 0;
+
 		bytes = min(count, sizeof(buf));
 		if (copy_from_user(&buf, p, bytes))
 			return -EFAULT;
+
+		for (b = bytes ; b > 0 ; b -= sizeof(__u32), i++) {
+			if (!arch_get_random_int(&t))
+				break;
+			buf[i] ^= t;
+		}
 
 		count -= bytes;
 		p += bytes;
@@ -2110,23 +2118,14 @@ struct batched_entropy {
 
 /*
  * Get a random word for internal kernel use only. The quality of the random
- * number is either as good as RDRAND or as good as /dev/urandom, with the
- * goal of being quite fast and not depleting entropy.
+ * number is good as /dev/urandom, but there is no backtrack protection, with
+ * the goal of being quite fast and not depleting entropy.
  */
 static DEFINE_PER_CPU(struct batched_entropy, batched_entropy_u64);
 u64 get_random_u64(void)
 {
 	u64 ret;
 	struct batched_entropy *batch;
-
-#if BITS_PER_LONG == 64
-	if (arch_get_random_long((unsigned long *)&ret))
-		return ret;
-#else
-	if (arch_get_random_long((unsigned long *)&ret) &&
-	    arch_get_random_long((unsigned long *)&ret + 1))
-	    return ret;
-#endif
 
 	batch = &get_cpu_var(batched_entropy_u64);
 	if (batch->position % ARRAY_SIZE(batch->entropy_u64) == 0) {
@@ -2144,9 +2143,6 @@ u32 get_random_u32(void)
 {
 	u32 ret;
 	struct batched_entropy *batch;
-
-	if (arch_get_random_int(&ret))
-		return ret;
 
 	batch = &get_cpu_var(batched_entropy_u32);
 	if (batch->position % ARRAY_SIZE(batch->entropy_u32) == 0) {

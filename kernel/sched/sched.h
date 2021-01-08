@@ -2,8 +2,10 @@
 #include <linux/sched.h>
 #include <linux/sched/sysctl.h>
 #include <linux/sched/rt.h>
+#include <linux/sched/smt.h>
 #include <linux/u64_stats_sync.h>
 #include <linux/sched/deadline.h>
+#include <linux/kernel_stat.h>
 #include <linux/binfmts.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
@@ -140,7 +142,13 @@ static inline void update_idle_core(struct rq *rq) { }
 #ifdef CONFIG_64BIT
 # define NICE_0_LOAD_SHIFT	(SCHED_FIXEDPOINT_SHIFT + SCHED_FIXEDPOINT_SHIFT)
 # define scale_load(w)		((w) << SCHED_FIXEDPOINT_SHIFT)
-# define scale_load_down(w)	((w) >> SCHED_FIXEDPOINT_SHIFT)
+# define scale_load_down(w) \
+({ \
+	unsigned long __w = (w); \
+	if (__w) \
+		__w = max(2UL, __w >> SCHED_FIXEDPOINT_SHIFT); \
+	__w; \
+})
 #else
 # define NICE_0_LOAD_SHIFT	(SCHED_FIXEDPOINT_SHIFT)
 # define scale_load(w)		(w)
@@ -323,6 +331,8 @@ struct cfs_bandwidth {
 	/* statistics */
 	int nr_periods, nr_throttled;
 	u64 throttled_time;
+
+	bool distribute_running;
 #endif
 };
 
@@ -2211,14 +2221,19 @@ static inline void nohz_balance_exit_idle(unsigned int cpu) { }
 
 #ifdef CONFIG_IRQ_TIME_ACCOUNTING
 struct irqtime {
-	u64			hardirq_time;
-	u64			softirq_time;
+	u64			total;
+	u64			tick_delta;
 	u64			irq_start_time;
 	struct u64_stats_sync	sync;
 };
 
 DECLARE_PER_CPU(struct irqtime, cpu_irqtime);
 
+/*
+ * Returns the irqtime minus the softirq time computed by ksoftirqd.
+ * Otherwise ksoftirqd's sum_exec_runtime is substracted its own runtime
+ * and never move forward.
+ */
 static inline u64 irq_time_read(int cpu)
 {
 	struct irqtime *irqtime = &per_cpu(cpu_irqtime, cpu);
@@ -2227,7 +2242,7 @@ static inline u64 irq_time_read(int cpu)
 
 	do {
 		seq = __u64_stats_fetch_begin(&irqtime->sync);
-		total = irqtime->softirq_time + irqtime->hardirq_time;
+		total = irqtime->total;
 	} while (__u64_stats_fetch_retry(&irqtime->sync, seq));
 
 	return total;
@@ -2879,4 +2894,14 @@ find_first_cpu_bit(struct task_struct *p, const cpumask_t *search_cpus,
 		   bool *do_rotate, struct find_first_cpu_bit_env *env);
 #else
 #define find_first_cpu_bit(...) -1
+#endif
+
+#ifdef CONFIG_SMP
+static inline void sched_irq_work_queue(struct irq_work *work)
+{
+	if (likely(cpu_online(raw_smp_processor_id())))
+		irq_work_queue(work);
+	else
+		irq_work_queue_on(work, cpumask_any(cpu_online_mask));
+}
 #endif

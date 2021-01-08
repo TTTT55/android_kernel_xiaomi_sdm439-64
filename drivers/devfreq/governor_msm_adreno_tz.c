@@ -151,6 +151,8 @@ void compute_work_load(struct devfreq_dev_status *stats,
 		struct devfreq_msm_adreno_tz_data *priv,
 		struct devfreq *devfreq)
 {
+	u64 busy;
+
 	spin_lock(&sample_lock);
 	/*
 	 * Keep collecting the stats till the client

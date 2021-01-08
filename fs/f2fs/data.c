@@ -439,7 +439,10 @@ int f2fs_submit_page_bio(struct f2fs_io_info *fio)
 			fio->encrypted_page : fio->page;
 	struct inode *inode = fio->page->mapping->host;
 
-	verify_block_addr(fio, fio->new_blkaddr);
+	if (!f2fs_is_valid_blkaddr(fio->sbi, fio->new_blkaddr,
+			__is_meta_io(fio) ? META_GENERIC : DATA_GENERIC))
+		return -EFAULT;
+
 	trace_f2fs_submit_page_bio(page, fio);
 	f2fs_trace_ios(fio, 0);
 
@@ -493,7 +496,7 @@ next:
 		spin_unlock(&io->io_lock);
 	}
 
-	if (fio->old_blkaddr != NEW_ADDR)
+	if (__is_valid_data_blkaddr(fio->old_blkaddr))
 		verify_block_addr(fio, fio->old_blkaddr);
 	verify_block_addr(fio, fio->new_blkaddr);
 
@@ -564,6 +567,9 @@ static struct bio *f2fs_grab_read_bio(struct inode *inode, block_t blkaddr,
 	struct bio_post_read_ctx *ctx;
 	unsigned int post_read_steps = 0;
 
+	if (!f2fs_is_valid_blkaddr(sbi, blkaddr, DATA_GENERIC))
+		return ERR_PTR(-EFAULT);
+
 	bio = f2fs_bio_alloc(sbi, min_t(int, nr_pages, BIO_MAX_PAGES), false);
 	if (!bio)
 		return ERR_PTR(-ENOMEM);
@@ -586,9 +592,6 @@ static struct bio *f2fs_grab_read_bio(struct inode *inode, block_t blkaddr,
 		ctx->bio = bio;
 		ctx->enabled_steps = post_read_steps;
 		bio->bi_private = ctx;
-
-		/* wait the page to be moved by cleaning */
-		f2fs_wait_on_block_writeback(sbi, blkaddr);
 	}
 
 	return bio;
@@ -605,6 +608,9 @@ static int f2fs_submit_page_read(struct inode *inode, struct page *page,
 
 	if (f2fs_may_encrypt_bio(inode, NULL))
 		fscrypt_set_ice_dun(inode, bio, PG_DUN(inode, page));
+
+	/* wait for GCed page writeback via META_MAPPING */
+	f2fs_wait_on_block_writeback(inode, blkaddr);
 
 	if (bio_add_page(bio, page, PAGE_SIZE, 0) < PAGE_SIZE) {
 		bio_put(bio);
@@ -1074,7 +1080,13 @@ next_dnode:
 next_block:
 	blkaddr = datablock_addr(dn.inode, dn.node_page, dn.ofs_in_node);
 
-	if (blkaddr == NEW_ADDR || blkaddr == NULL_ADDR) {
+	if (__is_valid_data_blkaddr(blkaddr) &&
+		!f2fs_is_valid_blkaddr(sbi, blkaddr, DATA_GENERIC)) {
+		err = -EFAULT;
+		goto sync_out;
+	}
+
+	if (!is_valid_data_blkaddr(sbi, blkaddr)) {
 		if (create) {
 			if (unlikely(f2fs_cp_error(sbi))) {
 				err = -EIO;
@@ -1526,6 +1538,10 @@ got_it:
 				SetPageUptodate(page);
 				goto confused;
 			}
+
+			if (!f2fs_is_valid_blkaddr(F2FS_I_SB(inode), block_nr,
+								DATA_GENERIC))
+				goto set_error_page;
 		} else {
 			zero_user_segment(page, 0, PAGE_SIZE);
 			if (!PageUptodate(page))
@@ -1561,6 +1577,12 @@ submit_and_realloc:
 			if (bio_encrypted)
 				fscrypt_set_ice_dun(inode, bio, dun);
 		}
+		/*
+		 * If the page is under writeback, we need to wait for
+		 * its completion to see the correct decrypted data.
+		 */
+		f2fs_wait_on_block_writeback(inode, block_nr);
+
 		if (bio_add_page(bio, page, blocksize, 0) < blocksize)
 			goto submit_and_realloc;
 
@@ -1627,7 +1649,7 @@ static int encrypt_one_page(struct f2fs_io_info *fio)
 		return 0;
 
 	/* wait for GCed page writeback via META_MAPPING */
-	f2fs_wait_on_block_writeback(fio->sbi, fio->old_blkaddr);
+	f2fs_wait_on_block_writeback(inode, fio->old_blkaddr);
 
 retry_encrypt:
 	if (fscrypt_using_hardware_encryption(inode))
@@ -1723,15 +1745,6 @@ static inline bool need_inplace_update(struct f2fs_io_info *fio)
 	return should_update_inplace(inode, fio);
 }
 
-static inline bool valid_ipu_blkaddr(struct f2fs_io_info *fio)
-{
-	if (fio->old_blkaddr == NEW_ADDR)
-		return false;
-	if (fio->old_blkaddr == NULL_ADDR)
-		return false;
-	return true;
-}
-
 int do_write_data_page(struct f2fs_io_info *fio)
 {
 	struct page *page = fio->page;
@@ -1746,11 +1759,13 @@ int do_write_data_page(struct f2fs_io_info *fio)
 			f2fs_lookup_extent_cache(inode, page->index, &ei)) {
 		fio->old_blkaddr = ei.blk + page->index - ei.fofs;
 
-		if (valid_ipu_blkaddr(fio)) {
-			ipu_force = true;
-			fio->need_lock = LOCK_DONE;
-			goto got_it;
-		}
+		if (!f2fs_is_valid_blkaddr(fio->sbi, fio->old_blkaddr,
+							DATA_GENERIC))
+			return -EFAULT;
+
+		ipu_force = true;
+		fio->need_lock = LOCK_DONE;
+		goto got_it;
 	}
 
 	/* Deadlock due to between page->lock and f2fs_lock_op */
@@ -1766,14 +1781,22 @@ int do_write_data_page(struct f2fs_io_info *fio)
 	/* This page is already truncated */
 	if (fio->old_blkaddr == NULL_ADDR) {
 		ClearPageUptodate(page);
+		clear_cold_data(page);
 		goto out_writepage;
 	}
 got_it:
+	if (__is_valid_data_blkaddr(fio->old_blkaddr) &&
+		!f2fs_is_valid_blkaddr(fio->sbi, fio->old_blkaddr,
+							DATA_GENERIC)) {
+		err = -EFAULT;
+		goto out_writepage;
+	}
 	/*
 	 * If current allocation needs SSR,
 	 * it had better in-place writes for updated data.
 	 */
-	if (ipu_force || (valid_ipu_blkaddr(fio) && need_inplace_update(fio))) {
+	if (ipu_force || (is_valid_data_blkaddr(fio->sbi, fio->old_blkaddr) &&
+					need_inplace_update(fio))) {
 		err = encrypt_one_page(fio);
 		if (err)
 			goto out_writepage;
@@ -1827,7 +1850,7 @@ static int __write_data_page(struct page *page, bool *submitted,
 	loff_t i_size = i_size_read(inode);
 	const pgoff_t end_index = ((unsigned long long) i_size)
 							>> PAGE_SHIFT;
-	loff_t psize = (page->index + 1) << PAGE_SHIFT;
+	loff_t psize = (loff_t)(page->index + 1) << PAGE_SHIFT;
 	unsigned offset = 0;
 	bool need_balance_fs = false;
 	int err = 0;
@@ -1922,8 +1945,10 @@ done:
 
 out:
 	inode_dec_dirty_pages(inode);
-	if (err)
+	if (err) {
 		ClearPageUptodate(page);
+		clear_cold_data(page);
+	}
 
 	if (wbc->for_reclaim) {
 		f2fs_submit_merged_write_cond(sbi, inode, 0, page->index, DATA);
@@ -2349,10 +2374,6 @@ repeat:
 
 	f2fs_wait_on_page_writeback(page, DATA, false);
 
-	/* wait for GCed page writeback via META_MAPPING */
-	if (f2fs_post_read_required(inode))
-		f2fs_wait_on_block_writeback(sbi, blkaddr);
-
 	if (len == PAGE_SIZE || PageUptodate(page))
 		return 0;
 
@@ -2540,6 +2561,8 @@ void f2fs_invalidate_page(struct page *page, unsigned int offset,
 		}
 	}
 
+	clear_cold_data(page);
+
 	/* This is atomic written page, keep Private */
 	if (IS_ATOMIC_WRITTEN_PAGE(page))
 		return drop_inmem_page(inode, page);
@@ -2558,6 +2581,7 @@ int f2fs_release_page(struct page *page, gfp_t wait)
 	if (IS_ATOMIC_WRITTEN_PAGE(page))
 		return 0;
 
+	clear_cold_data(page);
 	set_page_private(page, 0);
 	ClearPagePrivate(page);
 	return 1;

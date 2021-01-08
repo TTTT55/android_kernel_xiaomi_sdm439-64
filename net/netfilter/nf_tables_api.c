@@ -263,6 +263,9 @@ static int nft_delrule_by_chain(struct nft_ctx *ctx)
 	int err;
 
 	list_for_each_entry(rule, &ctx->chain->rules, list) {
+		if (!nft_is_active_next(ctx->net, rule))
+			continue;
+
 		err = nft_delrule(ctx, rule);
 		if (err < 0)
 			return err;
@@ -2476,12 +2479,13 @@ struct nft_set *nf_tables_set_lookup_byid(const struct net *net,
 	u32 id = ntohl(nla_get_be32(nla));
 
 	list_for_each_entry(trans, &net->nft.commit_list, list) {
-		struct nft_set *set = nft_trans_set(trans);
+		if (trans->msg_type == NFT_MSG_NEWSET) {
+			struct nft_set *set = nft_trans_set(trans);
 
-		if (trans->msg_type == NFT_MSG_NEWSET &&
-		    id == nft_trans_set_id(trans) &&
-		    nft_active_genmask(set, genmask))
-			return set;
+			if (id == nft_trans_set_id(trans) &&
+			    nft_active_genmask(set, genmask))
+				return set;
+		}
 	}
 	return ERR_PTR(-ENOENT);
 }
@@ -2588,7 +2592,8 @@ static int nf_tables_fill_set(struct sk_buff *skb, const struct nft_ctx *ctx,
 			goto nla_put_failure;
 	}
 
-	if (nla_put(skb, NFTA_SET_USERDATA, set->udlen, set->udata))
+	if (set->udata &&
+	    nla_put(skb, NFTA_SET_USERDATA, set->udlen, set->udata))
 		goto nla_put_failure;
 
 	desc = nla_nest_start(skb, NFTA_SET_DESC);
