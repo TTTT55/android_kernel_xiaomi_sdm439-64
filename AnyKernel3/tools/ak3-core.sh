@@ -763,4 +763,4 @@ setup_ak() {
 
 ### end methods
 
-setup_ak;
+t/ramdisk;
