@@ -394,6 +394,10 @@ KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 		   -Werror-implicit-function-declaration \
 		   -Wno-format-security \
 		   -Wno-unused-variable \
+		   -Wno-typedef-redefinition \
+		   -Wno-parentheses-equality \
+		   -Wno-enum-conversion \
+		   -Wno-non-literal-null-conversion \
 		   -std=gnu89
 KBUILD_CPPFLAGS := -D__KERNEL__
 KBUILD_AFLAGS_KERNEL :=

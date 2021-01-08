@@ -1544,26 +1544,7 @@ limProcessAssocReqFrame(tpAniSirGlobal pMac, tANI_U8 *pRxPacketInfo,
                                    subType, 0,psessionEntry, NULL);
 
                     goto error;
-                    
-                }
 
-                akm_type = lim_translate_rsn_oui_to_akm_type(
-                                    Dot11fIERSN.akm_suite[0]);
-
-                if (akm_type == ANI_AKM_TYPE_SAE) {
-                    if (eSIR_SUCCESS != (status =
-                        lim_check_sae_pmf_cap(psessionEntry, &Dot11fIERSN))) {
-                        /* Reject pmf disable SAE STA */
-                        limLog(pMac, LOGW, FL("Rejecting Re/Assoc req from STA:"
-                                MAC_ADDRESS_STR), MAC_ADDR_ARRAY(pHdr->sa));
-                        limSendAssocRspMgmtFrame(
-                                    pMac,
-                                    status,
-                                    1,
-                                    pHdr->sa,
-                                    subType, 0,psessionEntry, NULL);
-                        goto error;
-                    }
                 }
 
             } /* end - if(pAssocReq->rsnPresent) */
